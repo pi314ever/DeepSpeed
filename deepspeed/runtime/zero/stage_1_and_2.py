@@ -2087,10 +2087,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     # Promote loss scale so it can be retrieved or set via "fp16_optimizer_instance.loss_scale"
     def _get_loss_scale(self):
+        # TODO: SW-187114 Remove WA: cast self.loss_scale to float
         if self.custom_loss_scaler:
-            return self.external_loss_scale
+            return float(self.external_loss_scale)
         else:
-            return self.loss_scaler.cur_scale
+            return float(self.loss_scaler.cur_scale)
 
     def _set_loss_scale(self, value):
         self.loss_scaler.cur_scale = value

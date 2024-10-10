@@ -953,6 +953,8 @@ def align_dense_tensors(tensor_list, alignment):
 
 def all_gather_into_tensor_dp_groups(groups_flat, partitioned_param_groups, dp_process_group):
     for group_id, (group_flat, partitioned_params) in enumerate(zip(groups_flat, partitioned_param_groups)):
+        if group_flat is None:
+            continue
         partition_id = dist.get_rank(group=dp_process_group[group_id])
         dp_world_size = dist.get_world_size(group=dp_process_group[group_id])
         if dp_world_size == 1:
@@ -968,6 +970,8 @@ def all_gather_dp_groups(groups_flat, partitioned_param_groups, dp_process_group
         return all_gather_into_tensor_dp_groups(groups_flat, partitioned_param_groups, dp_process_group)
 
     for group_id, partitioned_params in enumerate(partitioned_param_groups):
+        if partitioned_params is None:
+            continue
         # Sequential AllGather Best of both worlds
         partition_id = dist.get_rank(group=dp_process_group[group_id])
         dp_world_size = dist.get_world_size(group=dp_process_group[group_id])

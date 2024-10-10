@@ -246,6 +246,12 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
                                                            new_param="gather_16bit_weights_on_model_save")
     """ Deprecated, please use ``gather_16bit_weights_on_model_save`` """
 
+    use_all_reduce_for_fetch_params: bool = Field(False, alias="stage3_use_all_reduce_for_fetch_params")
+    """
+    Use all_reduce op when fetching module parameters at stage3. This allows to significantly improve
+    performance by reducing the overhead of concatenation and slicing on the host.
+    """
+
     ignore_unused_parameters: bool = True
     """
     Unused parameters in modules may be unexpected in static networks, but

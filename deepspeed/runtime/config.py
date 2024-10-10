@@ -170,6 +170,26 @@ def get_bfloat16_enabled(param_dict):
     return False
 
 
+def get_fp8_optimizer_enabled(param_dict):
+    if FP8_OPTIMIZER in param_dict.keys():
+        return get_scalar_param(param_dict[FP8_OPTIMIZER], FP8_OPTIMIZER_ENABLED, FP8_OPTIMIZER_ENABLED_DEFAULT)
+    return FP8_OPTIMIZER_ENABLED_DEFAULT
+
+
+def get_fp8_optimizer_master_weights_dtype(param_dict):
+    if FP8_OPTIMIZER in param_dict.keys():
+        val = get_scalar_param(param_dict[FP8_OPTIMIZER], FP8_OPTIMIZER_MASTER_WEIGHTS_DTYPE,
+                               FP8_OPTIMIZER_MASTER_WEIGHTS_DTYPE_DEFAULT)
+        if val == "fp32":
+            return torch.float32
+        elif val == "fp16":
+            return torch.float16
+        elif val == "bf16":
+            return torch.bfloat16
+        raise ValueError(f"Invalid master_weights_dtype. Supported data types: ['fp16', 'bf16', 'fp32']. Got: {val}")
+    return torch.float32
+
+
 def get_bfloat16_immediate_grad_update(param_dict):
     for key in [BFLOAT16, BFLOAT16_OLD]:
         if key in param_dict.keys():
@@ -830,6 +850,8 @@ class DeepSpeedConfig(object):
         self.bfloat16_immediate_grad_update = get_bfloat16_immediate_grad_update(param_dict)
         assert not (self.fp16_enabled
                     and self.bfloat16_enabled), 'bfloat16 and fp16 modes cannot be simultaneously enabled'
+        self.fp8_optimizer_enabled = get_fp8_optimizer_enabled(param_dict)
+        self.fp8_optimizer_master_weights_dtype = get_fp8_optimizer_master_weights_dtype(param_dict)
         self.fp16_master_weights_and_gradients = get_fp16_master_weights_and_grads_enabled(param_dict)
         self.amp_enabled = get_amp_enabled(param_dict)
         self.amp_params = get_amp_params(param_dict)
