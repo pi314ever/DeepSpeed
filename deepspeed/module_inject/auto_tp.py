@@ -346,10 +346,10 @@ class AutoTP():
             weight, bias = shard_chunk_mlp(child.weight.data, child.bias, dist.get_rank(), dist.get_world_size())
             return LinearLayer(weight=weight, bias=bias)
         # For Arctic model, bypass to all_reduce replacement for w2 weights
-        is_all_reduce_linear_bypass = False
+        arctic_w2_all_reduce_linear = False
         if 'Arctic' in str(self.module) and 'w2' in name:
-            is_all_reduce_linear_bypass = True
-        if name in self.all_reduce_linears or is_all_reduce_linear_bypass:
+            arctic_w2_all_reduce_linear = True
+        if name in self.all_reduce_linears or arctic_w2_all_reduce_linear:
             # if conv_linear_layer [weight_shape[1], weight_shape[0] // mp_size]
             # else [weight_shape[0], weight_shape[1] // mp_size]
 
