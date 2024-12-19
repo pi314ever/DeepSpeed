@@ -178,7 +178,6 @@ class PartitionedParameterCoordinator:
                     force=True)
                 self._invalidate_trace()
 
-    @compiler.disable
     def record_module(self, sub_module: Module) -> None:
         """adds sub module to trace"""
         if not self.is_record_trace():

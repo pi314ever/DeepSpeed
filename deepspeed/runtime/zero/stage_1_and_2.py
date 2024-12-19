@@ -309,6 +309,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             for param in param_group['params']:
                 if param.requires_grad:
                     param.grad_accum = None
+                    param.param_idx_in_group = len(trainable_parameters)
                     trainable_parameters.append(param)
             self.bit16_groups.append(trainable_parameters)
 
@@ -955,7 +956,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         assert grad_reduc is not None, f"rank {dist.get_rank()} - Invalid to reduce Param {param_id} with None gradient"
 
         self.grads_in_ipg_bucket.append(grad_reduc)
-        self.params_in_ipg_bucket.append((i, param, param_id))
+        self.params_in_ipg_bucket.append((i, param.param_idx_in_group, param_id))
 
         #make sure the average tensor function knows how to average the gradients
         if is_moe_param(param):
@@ -1059,8 +1060,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             process_group = self.dp_process_group
             # count = 0
-            for i, param, param_id in self.params_in_ipg_bucket:
+            for i, param_idx_in_group, param_id in self.params_in_ipg_bucket:
 
+                param = self.bit16_groups[i][param_idx_in_group]
                 process_group = self.dp_process_group
                 grad_reduc = self.get_gradient_for_reduction(param)
                 #Averages gradients at parameter level if ipg has a moe param
@@ -1382,8 +1384,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             stream = get_accelerator().current_stream()
 
         with get_accelerator().stream(stream):
-            for _, param, param_id in self.params_in_ipg_bucket:
-
+            for group_idx, param_idx_in_group, param_id in self.params_in_ipg_bucket:
+                param = self.bit16_groups[group_idx][param_idx_in_group]
                 assert self.params_already_reduced[param_id] == False, \
                     f"The parameter {param_id} has already been reduced. \
                     Gradient computed twice for this partition. \
@@ -2087,10 +2089,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     # Promote loss scale so it can be retrieved or set via "fp16_optimizer_instance.loss_scale"
     def _get_loss_scale(self):
+        # TODO: SW-187114 Remove WA: cast self.loss_scale to float
         if self.custom_loss_scaler:
-            return self.external_loss_scale
+            return float(self.external_loss_scale)
         else:
-            return self.loss_scaler.cur_scale
+            return float(self.loss_scaler.cur_scale)
 
     def _set_loss_scale(self, value):
         self.loss_scaler.cur_scale = value

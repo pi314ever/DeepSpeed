@@ -302,7 +302,17 @@ class BF16_Optimizer(ZeROOptimizer):
                                         mpu=self.mpu,
                                         use_graph=self.graph_harvesting)
 
+        for param_partition, grad_partition in zip(self.fp32_groups_flat_partition,
+                                                   self.fp32_groups_gradient_flat_partition):
+            # In case of grad acc dtype different than FP32, need to cast to high precision.
+            param_partition.grad = grad_partition.to(
+                param_partition.dtype) if grad_partition.dtype != param_partition.dtype else grad_partition
+
         self.optimizer.step()
+
+        if self.grad_acc_dtype is not torch.float32:
+            for param_partition in self.fp32_groups_flat_partition:
+                param_partition.grad = None
 
         # We need to link optimizer state after the first step() call
         self._lazy_init_hp_params_optimizer_state()
@@ -526,7 +536,7 @@ class BF16_Optimizer(ZeROOptimizer):
 
     def accumulate_hp_grads_and_remove_lp(self, lp_param, group_idx, param_idx):
         assert self.immediate_grad_update
-        self._update_hp_grad(lp_param, group_idx, param_idx, clear_lp_grads=True)
+        self._update_hp_grad(lp_param, group_idx, param_idx, clear_lp_grads=False)
 
     def create_grad_acc_hooks(self):
         self.grad_accs = []

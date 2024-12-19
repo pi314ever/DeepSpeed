@@ -12,6 +12,8 @@ from deepspeed.linear.quantization import QuantizedParameter
 from deepspeed.linear.config import QuantizationConfig
 
 from deepspeed.ops.op_builder import FPQuantizerBuilder
+# TODO: [SW-208941] clear gaudi specific code.
+from tests.unit.util import get_hpu_dev_version
 
 from unit.common import DistributedTest
 
@@ -38,11 +40,17 @@ class TestQuantParam(DistributedTest):
     def test_move_to_accelerator(self):
         device = get_accelerator().current_device()
         data = torch.rand(5, 5, device='cpu', dtype=torch.bfloat16)
-        qp = QuantizedParameter(data)
+        quantization_config = QuantizationConfig()
+        quantization_config.q_range_dtype = torch.float8_e4m3fn
+        quantization_config.q_dtype = torch.float8_e4m3fn
+        # TODO: [SW-208941] clear gaudi specific code.
+        if get_hpu_dev_version().lower() == 'gaudi2':
+            quantization_config.q_range_dtype = torch.float8_e4m3fnuz
+        qp = QuantizedParameter(data, quantization_config=quantization_config)
         assert qp.device == torch.device('cpu')
         qp = qp.to(get_accelerator().current_device_name())
         assert qp.device == torch.device(device)
-        assert qp.dtype == torch.int8
+        assert qp.dtype == torch.float8_e4m3fn
 
     def test_hf_clone(self):
         device = get_accelerator().current_device_name()

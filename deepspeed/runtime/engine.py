@@ -35,6 +35,8 @@ from deepspeed.runtime.fp16.fused_optimizer import FP16_Optimizer
 from deepspeed.runtime.fp16.unfused_optimizer import FP16_UnfusedOptimizer
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
 
+from deepspeed.linear.optimized_linear import LoRAOptimizedLinear
+
 from deepspeed.runtime.config import DEEPSPEED_OPTIMIZERS, \
     ADAGRAD_OPTIMIZER, ADAM_OPTIMIZER, ADAMW_OPTIMIZER, LAMB_OPTIMIZER, ONEBIT_ADAM_OPTIMIZER, ONEBIT_LAMB_OPTIMIZER, \
     TORCH_ADAM_PARAM, ADAM_W_MODE, ADAM_W_MODE_DEFAULT, ZERO_ONE_ADAM_OPTIMIZER, MUADAM_OPTIMIZER, MUADAMW_OPTIMIZER, \
@@ -90,15 +92,17 @@ from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoin
 
 from .pipe.module import PipelineModule
 from .utils import get_ma_status
-from .compiler import is_compile_supported
+from .compiler import is_compile_supported, compiled_autograd
 from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer
+from ..moe.capacity_bins import optimize_bins
 from ..moe.layer import MoE
 from ..moe.utils import is_moe_param, configure_moe_param_groups
 from ..git_version_info import version
 
 from deepspeed.profiling.flops_profiler.profiler import FlopsProfiler
 from deepspeed.utils.logging import print_json_dist, print_configuration
+from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
 
 from deepspeed.accelerator import get_accelerator
 
@@ -222,6 +226,7 @@ class DeepSpeedEngine(Module):
         self.num_experts = []
         self.gate_modules = []
         self.moe_layers = []
+        self.has_sequence_parallel_params = False
         self._step_applied = False
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
@@ -312,6 +317,14 @@ class DeepSpeedEngine(Module):
         elif self.bfloat16_enabled():
             self.optimizer = self._configure_bf16_optimizer(optimizer=None)
 
+        #Sequence parallel related initialization
+        for param in self.module.parameters():
+            if getattr(param, 'sequence_parallel', False):
+                self.has_sequence_parallel_params = True
+                break
+        if self.has_sequence_parallel_params:
+            assert self.mpu is not None, "sequence parallel allreduce only supported with tensor parallel enabled"
+
         # Hook optimizer for snip_momentum pruning
         if hasattr(model, 'pruners'):
             from ..compression.helper import rewrite_optimizer_step
@@ -325,6 +338,8 @@ class DeepSpeedEngine(Module):
             if isinstance(module, (torch.nn.Embedding, torch.nn.EmbeddingBag)) and self.sparse_gradients_enabled():
                 self.sparse_tensor_module_names.add(name + ".weight")
                 logger.info("Will convert {} to sparse tensor during training".format(name))
+
+        self._optimized_linear_offload_setup()
 
         self.save_non_zero_checkpoint = False
         self.save_zero_checkpoint = False
@@ -362,6 +377,46 @@ class DeepSpeedEngine(Module):
         self.unflatten = _unflatten_dense_tensors
 
         self._is_compiled = False
+        self._is_optimizer_compiled = False
+        self._is_compiled_autograd_enabled = False
+        self._compile_kwargs = {}
+
+    def _optimized_linear_offload_setup(self):
+        self.optimized_linear_base_weight_sharding = False
+        self.optimized_linear_lora_enabled = False
+        offload_ratio = None
+        for _, module in self.module.named_modules():
+            if isinstance(module, LoRAOptimizedLinear):
+                self.optimized_linear_lora_enabled = True
+                offload_ratio = None
+                if offload_ratio is not None:
+                    assert offload_ratio == module.lora_config.offload_ratio, \
+                        "all lora_config offload ratios should be the same across the model"
+                offload_ratio = module.lora_config.offload_ratio
+                if module.zero_shards > 1:
+                    # set attr so checkpoint saving can handle BWS properly
+                    self.optimized_linear_base_weight_sharding = True
+
+        if offload_ratio is None:
+            # Nothing enabled, do nothing
+            return
+
+        total_params = 0
+        for _, p in self.module.named_parameters():
+            if hasattr(p, 'ds_optim_param'):
+                total_params += p.numel()
+
+        offload_limit = total_params * offload_ratio
+        logger.info(f'offloading {offload_ratio*100}% of eligible params, specifically {offload_limit} params')
+        total_offloaded = 0
+        for _, p in self.module.named_parameters():
+            if hasattr(p, 'ds_optim_param'):
+                if total_offloaded < offload_limit:
+                    total_offloaded += p.numel()
+                    p.ds_offload = True
+                    p.offload()
+                else:
+                    p.ds_offload = False
 
     def destroy(self):
         if self.optimizer is not None and hasattr(self.optimizer, 'destroy'):
@@ -453,7 +508,10 @@ class DeepSpeedEngine(Module):
         Returns:
             float: norm
         """
-        return self._global_grad_norm
+        grad_norm = self._global_grad_norm
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = grad_norm.item()
+        return grad_norm
 
     def __getattr__(self, name):
         """
@@ -968,13 +1026,13 @@ class DeepSpeedEngine(Module):
         device_rank = args.device_rank if args is not None and hasattr(args, 'device_rank') else self.local_rank
         if device_rank >= 0:
             get_accelerator().set_device(device_rank)
-            self.device = torch.device(get_accelerator().device_name(), device_rank)
+            self.device = torch.device(get_accelerator().device_name(device_rank))
             self.world_size = dist.get_world_size()
             self.global_rank = dist.get_rank()
         else:
             self.world_size = 1
             self.global_rank = 0
-            self.device = torch.device(get_accelerator().device_name())
+            self.device = get_accelerator().device()
 
     # Configure based on command line arguments
     def _configure_with_arguments(self, args, mpu):
@@ -1054,9 +1112,12 @@ class DeepSpeedEngine(Module):
         def is_replicated(p):
             if hasattr(p, "ds_status") and p.ds_status is not ZeroParamStatus.AVAILABLE:
                 return False
+            elif hasattr(p, 'ds_optim_param'):
+                # do not broadcast OptimizedLinear parameters, they are unique per base weight shard
+                return False
             return True
 
-        for p in self.module.parameters():
+        for n, p in self.module.named_parameters():
             # Broadcast the model for different parameters
             if is_moe_param(p):
                 if torch.is_tensor(p) and is_replicated(p):
@@ -1962,35 +2023,36 @@ class DeepSpeedEngine(Module):
 
         self._start_timers(self.engine_timers.backward_inner_timers)
 
-        if self.zero_optimization():
-            self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
-            self.optimizer.backward(loss, retain_graph=retain_graph)
-        elif self.amp_enabled():
-            # AMP requires delaying unscale when inside gradient accumulation boundaries
-            # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
-            delay_unscale = not self.is_gradient_accumulation_boundary()
-            with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
-                scaled_loss.backward(retain_graph=retain_graph)
-        elif self.fp16_enabled():
-            if self.eigenvalue_enabled():
-                self.optimizer.backward(loss, create_graph=True, retain_graph=True)
-            else:
+        with compiled_autograd(self._is_compiled_autograd_enabled, self._compile_kwargs):
+            if self.zero_optimization():
+                self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
                 self.optimizer.backward(loss, retain_graph=retain_graph)
-        elif self.bfloat16_enabled():
-            self.optimizer.backward(loss)
-        else:
-            if self.eigenvalue_enabled():
-                loss.backward(create_graph=True, retain_graph=True)
+            elif self.amp_enabled():
+                # AMP requires delaying unscale when inside gradient accumulation boundaries
+                # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
+                delay_unscale = not self.is_gradient_accumulation_boundary()
+                with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
+                    scaled_loss.backward(retain_graph=retain_graph)
+            elif self.fp16_enabled():
+                if self.eigenvalue_enabled():
+                    self.optimizer.backward(loss, create_graph=True, retain_graph=True)
+                else:
+                    self.optimizer.backward(loss, retain_graph=retain_graph)
+            elif self.bfloat16_enabled():
+                self.optimizer.backward(loss)
             else:
-                loss.backward(retain_graph=retain_graph)
+                if self.eigenvalue_enabled():
+                    loss.backward(create_graph=True, retain_graph=True)
+                else:
+                    loss.backward(retain_graph=retain_graph)
 
-        self._stop_timers(self.engine_timers.backward_inner_timers)
+            self._stop_timers(self.engine_timers.backward_inner_timers)
 
-        self._start_timers(self.engine_timers.backward_reduce_timers)
+            self._start_timers(self.engine_timers.backward_reduce_timers)
 
-        if allreduce_gradients and self.enable_backward_allreduce:
-            # Traditional code path that allreduces the module parameter grads
-            self.allreduce_gradients()
+            if allreduce_gradients and self.enable_backward_allreduce:
+                # Traditional code path that allreduces the module parameter grads
+                self.allreduce_gradients()
 
         self._stop_timers(self.engine_timers.backward_reduce_timers)
 
@@ -2462,6 +2524,14 @@ class DeepSpeedEngine(Module):
         if self.has_moe_layers:
             self._reduce_expert_gradients(expert_grads, elements_per_buffer)
 
+        if self.has_sequence_parallel_params:
+            for i, group in enumerate(self.optimizer.bf16_groups):
+                for j, lp in enumerate(group):
+                    if getattr(lp, 'sequence_parallel', False):
+                        dist.all_reduce(self.optimizer.fp32_groups_gradients[i][j],
+                                        op=dist.ReduceOp.SUM,
+                                        group=self.mpu.get_slice_parallel_group())
+
     def sparse_allreduce_no_retain(self, bucket, dp_group, dp_world_size=None):
         allreduced_sparses = self.sparse_allreduce_bucket(bucket, dp_group, dp_world_size)
         # Densify sparse tensor and copy back to original location
@@ -2493,9 +2563,10 @@ class DeepSpeedEngine(Module):
             dp_world_size = dist.get_world_size(group=dp_group)
         if self.postscale_gradients():
             if self.gradient_average:
-                values.mul_(self.gradient_predivide_factor() / (dp_world_size))
+
+                values.mul_(self.gradient_predivide_factor() / (dp_world_size / float(self.sequence_parallel_size)))
         else:
-            values.mul_(1. / (dp_world_size))
+            values.mul_(1. / (dp_world_size / float(self.sequence_parallel_size)))
 
         indices_device_list = self.sparse_all_gather(indices, dp_group)
         values_device_list = self.sparse_all_gather(values, dp_group)
@@ -3604,7 +3675,11 @@ class DeepSpeedEngine(Module):
             gc.collect()
             get_accelerator().empty_cache()
 
-    def compile(self, backend=get_accelerator().get_compile_backend(), compile_kwargs={}) -> None:
+    def compile(self,
+                backend=get_accelerator().get_compile_backend(),
+                compile_kwargs={},
+                compile_optimizer_step=False,
+                compiled_autograd_enabled=False) -> None:
         """Compile the module using the specified backend and kwargs.
         If a compiler_fn is set, it will be used instead of torch.compile().
         """
@@ -3616,7 +3691,94 @@ class DeepSpeedEngine(Module):
 
         self.module.compile(backend=backend, **compile_kwargs)
         self._is_compiled = True
+        if compile_optimizer_step:
+            if not self._is_optimizer_compiled:
+                self.optimizer.step = torch.compile(self.optimizer.step, backend=backend, **compile_kwargs)
+                self._is_optimizer_compiled = True
+        self._is_compiled_autograd_enabled = compiled_autograd_enabled
+        self._compile_kwargs = compile_kwargs
 
     @property
     def is_compiled(self) -> bool:
         return self._is_compiled
+
+    def optimize_moe(self, step, max_grouped_experts=1):
+        """ Optimize MoE gate capacity bins
+
+            If MoE is using capacity bins, optimize the bins based on running stats.
+            In order to reduce the number of compilation recipes, we optimize a set
+            of grouped gates together.
+            The grouped gates must have same number of experts.
+        """
+        if not self.has_moe_layers:
+            return
+
+        # find all gates with capacity factor
+        gate_with_capacity_bins_idx = [i for i, gate in enumerate(self.gate_modules) if gate.has_capacity_bins()]
+        if len(gate_with_capacity_bins_idx) == 0:
+            return
+
+        # handle only gates have capacity bins usage statistics
+        gate_capacity_bin_stats = OrderedDict()
+        for i in gate_with_capacity_bins_idx:
+            gate = self.gate_modules[i]
+            if hasattr(gate, 'get_stats'):
+                stats = gate.get_stats(incremental=False)
+                if stats is not None and 'capacity_bins' in stats:
+                    gate_capacity_bin_stats[i] = stats['capacity_bins']
+        if len(gate_capacity_bin_stats) == 0:
+            return
+
+        del gate_with_capacity_bins_idx  # removing the list because it is out of date
+
+        # divide gates into groups up to max_grouped_experts or until different num_experts encountered
+        gate_groups = []
+        first_gate_idx = list(gate_capacity_bin_stats.keys())[0]
+        current_group = [first_gate_idx]
+        current_group_n_experts = self.num_experts[first_gate_idx]
+        for i in list(gate_capacity_bin_stats.keys())[1:]:
+            if self.num_experts[i] == current_group_n_experts and len(current_group) < max_grouped_experts:
+                current_group.append(i)
+            else:
+                gate_groups.append(current_group)
+                current_group = [i]
+                current_group_n_experts = self.num_experts[i]
+        gate_groups.append(current_group)
+
+        # print new optimized groups for each pipeline stage (no sharing across pp stages)
+        dp_rank = dist.get_rank(group=self.mpu.get_data_parallel_group())
+        tp_rank = bwc_tensor_model_parallel_rank(self.mpu)
+        log_ranks = [self.global_rank] if dp_rank == 0 and tp_rank == 0 else []
+
+        # for each group, (1) accumulate stats (2) calculate optimized capacity and (3) reconfigure bins
+        for gate_group in gate_groups:
+            group_stats = []
+            for i in gate_group:
+                group_stats.append(gate_capacity_bin_stats[i])
+
+            # sanity - verify all gates in groups have same bins edges
+            bins_edges = [stats['edges'] for stats in group_stats]
+            same_edges = all(torch.equal(bins_edges[0], tensor) for tensor in bins_edges[1:])
+            assert same_edges, f'Got different capacity bin edges for group={gate_group} edges={bins_edges}'
+
+            # accumulate usage
+            stacked_usage = torch.stack([stats['usage'] for stats in group_stats], dim=0)
+            total_group_usage = torch.sum(stacked_usage, dim=0)
+
+            # find optimized bins for this group
+            min_range = group_stats[0]['min_range']
+            current_bins = group_stats[0]['edges']
+            alignment = group_stats[0]['alignment']
+            min_bin_size = group_stats[0]['min_bin_size']
+            new_bins = optimize_bins(min_range=min_range,
+                                     bins=current_bins,
+                                     bins_usage=total_group_usage,
+                                     alignment=alignment,
+                                     min_bin_size=min_bin_size)
+
+            # configure gates in group with new bins
+            for i in gate_group:
+                gate = self.gate_modules[i]
+                capacity_bins = gate.get_capacity_bins()
+                capacity_bins.set_bins(new_bins)
+            log_dist(f'step={step}, optimize capacity bins for group={gate_group} bins={new_bins}', ranks=log_ranks)

@@ -4,12 +4,16 @@
 # DeepSpeed Team
 
 import torch
+import os
 
 from typing import Any, Tuple
 from torch import Tensor
 from torch.nn import Module
 
 import deepspeed.comm as dist
+
+# TODO[SW-207148]: Remove the WA below once there is a proper fix
+transpose_dim = int(os.environ.get('HL_DS_DISTRIBUTED_ATTENTION_SEQ_DIM', "2"))
 
 
 def single_all_to_all(input, scatter_idx, gather_idx, group):
@@ -33,7 +37,8 @@ def single_all_to_all(input, scatter_idx, gather_idx, group):
 
     # if scattering the seq-dim, transpose the heads back to the original dimension
     if scatter_idx < 2:
-        output = output.transpose(0, 2).contiguous()
+        # TODO[SW-207148]: Remove the WA below once there is a proper fix
+        output = output.transpose(0, transpose_dim).contiguous()
 
     return output.reshape(
         inp_shape[: gather_idx] + \

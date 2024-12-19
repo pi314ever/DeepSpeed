@@ -5,10 +5,15 @@
 
 import pytest
 import torch
+from deepspeed.linear import QuantizationConfig
+
 import deepspeed
 
 from deepspeed.ops.fp_quantizer import FP_Quantize
 from deepspeed.ops.op_builder import FPQuantizerBuilder
+from deepspeed.accelerator import get_accelerator
+# TODO: [SW-208941] clear gaudi specific code.
+from tests.unit.util import get_hpu_dev_version
 
 if not deepspeed.ops.__compatible_ops__[FPQuantizerBuilder.NAME]:
     pytest.skip("FPQuantizer op is not available on this system", allow_module_level=True)
@@ -17,7 +22,7 @@ if not deepspeed.ops.__compatible_ops__[FPQuantizerBuilder.NAME]:
 from qtorch.quant import float_quantize
 
 
-def qtorch_quantize(input, exp_bits=4, man_bits=3, rounding="nearest", group_size=1024):
+def qtorch_quantize(input, exp_bits=4, man_bits=3, rounding="nearest", group_size=1024, quant_config=None):
     ori_dt = input.dtype
     ori_shape = input.shape
     last_dim = group_size
@@ -26,7 +31,7 @@ def qtorch_quantize(input, exp_bits=4, man_bits=3, rounding="nearest", group_siz
     q_bits = exp_bits + man_bits + 1
     input_to_float = input.float()
     if q_bits == 8:
-        q_range = 480.
+        q_range = torch.finfo(quant_config.q_range_dtype).max
     elif q_bits == 6:
         q_range = 28.
     elif q_bits == 12:
@@ -41,20 +46,33 @@ def qtorch_quantize(input, exp_bits=4, man_bits=3, rounding="nearest", group_siz
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 def test_fp_quant_meta(dtype):
+    device_name = get_accelerator().device_name()
     group_size = 128
     q_bits = 8
     exp_bits = 4
     man_bits = 3
 
-    fpq = FP_Quantize(group_size=group_size)
-    for i in range(10):
-        x = torch.rand(4, 1024, dtype=dtype, device='cuda')
+    quant_config = QuantizationConfig()
+    quant_config.q_range_dtype = torch.float8_e4m3fn
+    quant_config.q_dtype = torch.float8_e4m3fn
+    # TODO: [SW-208941] clear gaudi specific code.
+    if get_hpu_dev_version().lower() == 'gaudi2':
+        quant_config.q_range_dtype = torch.float8_e4m3fnuz
+    quant_config.group_size = group_size
+    fpq = FP_Quantize(quantization_config=quant_config)
 
-        ds_x = x.clone()
+    for i in range(10):
+        x = torch.rand(4, 1024, dtype=dtype)
+
+        ds_x = x.clone().to(device_name)
         x_quantized, meta_tensor = fpq.quantize(ds_x, q_bits=q_bits, return_meta_tensor=True)
         x_dequantized = fpq.dequantize(x_quantized, q_bits=q_bits, scale=meta_tensor)
 
-        qtorch_out = qtorch_quantize(x, exp_bits=exp_bits, man_bits=man_bits, group_size=group_size)
+        qtorch_out = qtorch_quantize(x,
+                                     exp_bits=exp_bits,
+                                     man_bits=man_bits,
+                                     group_size=group_size,
+                                     quant_config=quant_config)
         qtorch_error = (qtorch_out - x).abs().sum() / x.numel()
         ds_error = (x_dequantized - x).abs().sum() / x.numel()
 
@@ -68,12 +86,22 @@ def test_fp_quant_selective(dtype):
     exp_bits = 4
     man_bits = 3
 
-    fpq = FP_Quantize(group_size=group_size)
-    indexes = torch.zeros(2, dtype=torch.int32, device='cuda')
+    device_name = get_accelerator().device_name()
+
+    quant_config = QuantizationConfig()
+    quant_config.q_range_dtype = torch.float8_e4m3fn
+    quant_config.q_dtype = torch.float8_e4m3fn
+    # TODO: [SW-208941] clear gaudi specific code.
+    if get_hpu_dev_version().lower() == 'gaudi2':
+        quant_config.q_range_dtype = torch.float8_e4m3fnuz
+    quant_config.group_size = group_size
+    fpq = FP_Quantize(quantization_config=quant_config)
+
+    indexes = torch.zeros(2, dtype=torch.int32, device=device_name)
     indexes[0] = 1
     indexes[1] = 3
     for i in range(10):
-        x = torch.rand(4, 1024, dtype=dtype, device='cuda')
+        x = torch.rand(4, 1024, dtype=dtype, device=device_name)
 
         x = x.reshape(4, 1, x.shape[-1])
         ds_x = x.clone()
@@ -93,13 +121,21 @@ def test_fp_quant_selective(dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 @pytest.mark.parametrize("q_bits", [8, 6, 12], ids=["qbits8", "qbits6", "qbits12"])
 def test_fp_quant(dtype, q_bits):
-    group_size = 128
-    fpq = FP_Quantize(group_size=group_size)
+    device_name = get_accelerator().device_name()
+
+    quant_config = QuantizationConfig()
+    quant_config.q_range_dtype = torch.float8_e4m3fn
+    quant_config.q_dtype = torch.float8_e4m3fn
+    # TODO: [SW-208941] clear gaudi specific code.
+    if get_hpu_dev_version().lower() == 'gaudi2':
+        quant_config.q_range_dtype = torch.float8_e4m3fnuz
+    quant_config.group_size = 128
+    fpq = FP_Quantize(quantization_config=quant_config)
 
     for i in range(10):
-        x = torch.rand(4, 1024, dtype=dtype, device='cuda')
+        x = torch.rand(4, 1024, dtype=dtype)
 
-        ds_x = x.clone()
+        ds_x = x.clone().to(device_name)
         x_quantized = fpq.quantize(ds_x, q_bits=q_bits)
         x_dequantized = fpq.dequantize(x_quantized, q_bits=q_bits)
 
@@ -115,7 +151,11 @@ def test_fp_quant(dtype, q_bits):
         else:
             raise ValueError(f"unknown {q_bits=}")
 
-        qtorch_out = qtorch_quantize(x, exp_bits=exp_bits, man_bits=man_bits, group_size=group_size)
+        qtorch_out = qtorch_quantize(x,
+                                     exp_bits=exp_bits,
+                                     man_bits=man_bits,
+                                     group_size=quant_config.group_size,
+                                     quant_config=quant_config)
 
         qtorch_error = (qtorch_out - x).abs().sum() / x.numel()
         ds_error = (x_dequantized - x).abs().sum() / x.numel()
